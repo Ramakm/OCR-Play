@@ -1,0 +1,15 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+requests==2.32.3
+Pillow==10.4.0
+torch==2.6.0
+transformers==4.46.3
+tokenizers==0.20.3
+einops
+addict
+easydict
+# GPU only — comment out if no CUDA
+# flash-attn==2.7.3
+# PDF support
+pdf2image==1.17.0
