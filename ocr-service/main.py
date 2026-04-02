@@ -1,58 +1,18 @@
 """
-DeepSeek OCR microservice
-- POST /ocr   → extract raw text from image using deepseek-ai/DeepSeek-OCR
-- POST /convert → full pipeline: OCR text → structured JSON via DeepSeek chat API
+OCR microservice — Tesseract OCR + rule-based JSON extractor (no external API needed)
+- POST /ocr     → extract raw text from image
+- POST /convert → full pipeline: OCR text → structured JSON
 """
 
-import os
 import io
-import json
-import base64
-import tempfile
 import re
 
-import torch
-import requests
+import pytesseract
 from PIL import Image
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from transformers import AutoModel, AutoTokenizer
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-MODEL_NAME = "deepseek-ai/DeepSeek-OCR"
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-DEEPSEEK_CHAT_URL = "https://api.deepseek.com/chat/completions"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-# ---------------------------------------------------------------------------
-# Model (lazy-load on first request to keep startup fast)
-# ---------------------------------------------------------------------------
-_model = None
-_tokenizer = None
-
-
-def get_model():
-    global _model, _tokenizer
-    if _model is None:
-        print(f"[OCR] Loading DeepSeek-OCR model on {DEVICE}...")
-        _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-        load_kwargs = dict(trust_remote_code=True, use_safetensors=True)
-        if DEVICE == "cuda":
-            load_kwargs["_attn_implementation"] = "flash_attention_2"
-        _model = AutoModel.from_pretrained(MODEL_NAME, **load_kwargs)
-        _model = _model.eval()
-        if DEVICE == "cuda":
-            _model = _model.cuda().to(torch.bfloat16)
-        print("[OCR] Model loaded.")
-    return _model, _tokenizer
-
-
-# ---------------------------------------------------------------------------
-# App
-# ---------------------------------------------------------------------------
-app = FastAPI(title="DeepSeek OCR Service")
+app = FastAPI(title="OCR Service")
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,98 +23,165 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# OCR
 # ---------------------------------------------------------------------------
-def run_ocr(image_bytes: bytes, mime_type: str) -> str:
-    """Run DeepSeek-OCR on raw image bytes and return extracted text."""
-    model, tokenizer = get_model()
 
+def run_ocr(image_bytes: bytes, mime_type: str) -> str:
     if mime_type == "application/pdf":
-        # Convert first page of PDF to image via pdf2image
         try:
             from pdf2image import convert_from_bytes
         except ImportError:
             raise HTTPException(
                 status_code=422,
-                detail="pdf2image not installed. Run: pip install pdf2image poppler-utils",
+                detail="pdf2image not installed. Run: pip install pdf2image",
             )
         pages = convert_from_bytes(image_bytes, first_page=1, last_page=1, dpi=200)
         img = pages[0]
     else:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    # Save to temp file (DeepSeek-OCR model.infer expects a file path)
-    suffix = ".jpg" if mime_type != "image/png" else ".png"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        img.save(tmp.name)
-        tmp_path = tmp.name
+    return pytesseract.image_to_string(img).strip()
 
+
+# ---------------------------------------------------------------------------
+# Rule-based structured extractor
+# ---------------------------------------------------------------------------
+
+def _find(patterns: list[str], text: str) -> str | None:
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def _parse_amount(s: str | None) -> float | None:
+    if not s:
+        return None
+    cleaned = re.sub(r"[^\d.]", "", s)
     try:
-        response = model.infer(
-            tokenizer,
-            prompt="<image>\nFree OCR.",
-            image_file=tmp_path,
-            base_size=1024,
-            image_size=640,
-            crop_mode=True,
-        )
-    finally:
-        os.unlink(tmp_path)
-
-    return response if isinstance(response, str) else str(response)
+        return float(cleaned)
+    except ValueError:
+        return None
 
 
-def ocr_text_to_json(ocr_text: str) -> dict:
-    """Send OCR text to DeepSeek chat API and get back structured JSON."""
-    if not DEEPSEEK_API_KEY:
-        raise HTTPException(status_code=500, detail="DEEPSEEK_API_KEY not set")
+def _extract_items(text: str) -> list[dict]:
+    """
+    Heuristic: look for lines that have a description + a money amount.
+    e.g. "Web Design  1  500.00  500.00"
+    """
+    items = []
+    money_re = r"\d[\d,]*\.\d{2}"
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        amounts = re.findall(money_re, line)
+        if not amounts:
+            continue
+        # Remove all numbers / amounts from the line to get the description
+        desc = re.sub(money_re, "", line)
+        desc = re.sub(r"\s{2,}", " ", desc).strip(" :-|")
+        if not desc:
+            continue
+        total_str = amounts[-1]
+        unit_price_str = amounts[-2] if len(amounts) >= 2 else amounts[0]
+        qty_m = re.search(r"\b(\d+)\b", re.sub(money_re, "", line))
+        qty = int(qty_m.group(1)) if qty_m else 1
+        items.append({
+            "description": desc,
+            "quantity": qty,
+            "unit_price": _parse_amount(unit_price_str),
+            "total": _parse_amount(total_str),
+        })
+    return items
 
-    prompt = (
-        "You are a document parser. The following is raw OCR text extracted from a document.\n"
-        "Convert it into structured JSON.\n\n"
-        "Rules:\n"
-        "- Identify key fields: invoice_number, date, total, subtotal, tax, currency, vendor, recipient, "
-        "payment_method, items (list with description, quantity, unit_price, total), notes\n"
-        "- If a field is missing or unreadable, set it to null\n"
-        "- Return ONLY valid JSON — no explanations, no markdown, no code blocks\n\n"
-        f"OCR Text:\n{ocr_text}"
-    )
 
-    resp = requests.post(
-        DEEPSEEK_CHAT_URL,
-        headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"},
-        json={
-            "model": "deepseek-chat",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.0,
-            "max_tokens": 2048,
-        },
-        timeout=60,
-    )
-    resp.raise_for_status()
+def ocr_text_to_json(text: str) -> dict:
+    invoice_number = _find([
+        r"invoice\s*(?:#|no\.?|number)?\s*[:\-]?\s*([A-Z0-9\-/]+)",
+        r"inv\s*[:\-]?\s*([A-Z0-9\-/]+)",
+        r"bill\s*(?:#|no\.?)?\s*[:\-]?\s*([A-Z0-9\-/]+)",
+    ], text)
 
-    raw = resp.json()["choices"][0]["message"]["content"].strip()
-    # Strip markdown code fences if present
-    cleaned = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+    date = _find([
+        r"(?:invoice\s+)?date\s*[:\-]?\s*([\d]{1,2}[\/\-\.][\d]{1,2}[\/\-\.][\d]{2,4})",
+        r"(?:invoice\s+)?date\s*[:\-]?\s*([A-Za-z]+\s+\d{1,2},?\s+\d{4})",
+        r"\b(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})\b",
+    ], text)
 
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=422, detail=f"DeepSeek returned invalid JSON: {e}")
+    total = _parse_amount(_find([
+        r"(?:grand\s+)?total\s*(?:due|amount)?\s*[:\-]?\s*[\$£€]?\s*([\d,]+\.\d{2})",
+        r"amount\s+due\s*[:\-]?\s*[\$£€]?\s*([\d,]+\.\d{2})",
+        r"balance\s+due\s*[:\-]?\s*[\$£€]?\s*([\d,]+\.\d{2})",
+    ], text))
+
+    subtotal = _parse_amount(_find([
+        r"sub\s*total\s*[:\-]?\s*[\$£€]?\s*([\d,]+\.\d{2})",
+    ], text))
+
+    tax = _parse_amount(_find([
+        r"(?:tax|vat|gst|hst)\s*(?:\([\d.]+%\))?\s*[:\-]?\s*[\$£€]?\s*([\d,]+\.\d{2})",
+    ], text))
+
+    currency_m = re.search(r"(\$|£|€|USD|EUR|GBP|INR|CAD|AUD)", text)
+    currency = currency_m.group(1) if currency_m else None
+
+    vendor = _find([
+        r"(?:from|vendor|seller|billed\s+by|company)\s*[:\-]\s*(.+)",
+        r"^([A-Z][A-Za-z\s&.,]+(?:LLC|Inc|Ltd|Co|Corp|GmbH)[\.\,]?)",
+    ], text)
+
+    recipient = _find([
+        r"(?:bill\s+to|to|client|customer|recipient)\s*[:\-]\s*(.+)",
+    ], text)
+
+    payment_method = _find([
+        r"(?:payment\s+method|paid\s+via|pay\s+by)\s*[:\-]?\s*(.+)",
+    ], text)
+
+    items = _extract_items(text)
+
+    notes = _find([
+        r"(?:notes?|remarks?|comments?)\s*[:\-]\s*(.+)",
+    ], text)
+
+    return {
+        "invoice_number": invoice_number,
+        "date": date,
+        "vendor": vendor,
+        "recipient": recipient,
+        "currency": currency,
+        "subtotal": subtotal,
+        "tax": tax,
+        "total": total,
+        "payment_method": payment_method,
+        "items": items if items else None,
+        "notes": notes,
+        "raw_fields": _extract_all_key_values(text),
+    }
+
+
+def _extract_all_key_values(text: str) -> dict:
+    """Catch-all: extract any 'Label: Value' pairs found in the document."""
+    result = {}
+    for m in re.finditer(r"^([A-Za-z][A-Za-z\s]{1,30})\s*[:\-]\s*(.+)$", text, re.MULTILINE):
+        key = re.sub(r"\s+", "_", m.group(1).strip().lower())
+        result[key] = m.group(2).strip()
+    return result
 
 
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "device": DEVICE}
+    return {"status": "ok", "ocr_engine": "tesseract", "parser": "rule-based"}
 
 
 @app.post("/ocr")
 async def extract_text(file: UploadFile = File(...)):
-    """Extract raw OCR text from an uploaded image."""
     image_bytes = await file.read()
     text = run_ocr(image_bytes, file.content_type or "image/jpeg")
     return {"text": text}
@@ -162,13 +189,15 @@ async def extract_text(file: UploadFile = File(...)):
 
 @app.post("/convert")
 async def convert(file: UploadFile = File(...)):
-    """Full pipeline: image → OCR text → structured JSON."""
     allowed = {"image/png", "image/jpeg", "image/jpg", "image/webp", "application/pdf"}
     if file.content_type not in allowed:
         raise HTTPException(status_code=400, detail=f"Unsupported type: {file.content_type}")
 
     image_bytes = await file.read()
     ocr_text = run_ocr(image_bytes, file.content_type)
-    structured = ocr_text_to_json(ocr_text)
 
+    if not ocr_text:
+        raise HTTPException(status_code=422, detail="No text could be extracted from the image.")
+
+    structured = ocr_text_to_json(ocr_text)
     return {"data": structured, "ocr_text": ocr_text}

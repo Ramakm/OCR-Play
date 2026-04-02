@@ -23,10 +23,18 @@ export async function convertImageToJson(
     )
   }
 
-  const body = await res.json()
   if (!res.ok) {
-    throw new Error(body.detail ?? 'OCR service error')
+    let detail = 'OCR service error'
+    try {
+      const body = await res.json()
+      detail = body.detail ?? detail
+    } catch {
+      detail = (await res.text().catch(() => '')) || detail
+    }
+    throw new Error(detail)
   }
+
+  const body = await res.json()
 
   return body as ConvertResult
 }

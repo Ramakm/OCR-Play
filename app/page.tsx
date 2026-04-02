@@ -100,7 +100,7 @@ export default function Home() {
           </div>
           <div className="flex items-center gap-2">
             <span className="px-2.5 py-1 rounded-full bg-sky-500/10 text-sky-400 text-xs font-medium border border-sky-500/20">
-              Powered by DeepSeek OCR
+              Powered by Tesseract OCR
             </span>
           </div>
         </div>
@@ -113,7 +113,7 @@ export default function Home() {
             Extract JSON from any document
           </h1>
           <p className="text-slate-400 text-sm max-w-lg mx-auto">
-            Upload invoices, receipts, or forms. DeepSeek OCR extracts the text, then DeepSeek Chat structures it into clean JSON.
+            Upload invoices, receipts, or forms. Tesseract OCR extracts the text, then a rule-based parser structures it into clean JSON.
           </p>
         </div>
 
@@ -172,8 +172,8 @@ export default function Home() {
               <p className="text-xs font-medium text-slate-500 uppercase tracking-wider mb-3">Pipeline</p>
               <div className="flex flex-col gap-2">
                 {[
-                  { step: '1', label: 'DeepSeek-OCR', desc: 'Extracts raw text from image', color: 'text-sky-400', bg: 'bg-sky-500/10' },
-                  { step: '2', label: 'DeepSeek Chat', desc: 'Structures text into JSON', color: 'text-blue-400', bg: 'bg-blue-500/10' },
+                  { step: '1', label: 'Tesseract OCR', desc: 'Extracts raw text from image', color: 'text-sky-400', bg: 'bg-sky-500/10' },
+                  { step: '2', label: 'Rule-based Parser', desc: 'Structures text into JSON', color: 'text-blue-400', bg: 'bg-blue-500/10' },
                 ].map(({ step, label, desc, color, bg }) => (
                   <div key={step} className={`flex items-center gap-3 px-3 py-2.5 rounded-xl ${bg}`}>
                     <span className={`w-5 h-5 rounded-full border border-current flex items-center justify-center text-xs font-bold ${color}`}>

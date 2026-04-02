@@ -8,7 +8,7 @@ export default function LoadingSpinner() {
       </div>
       <div className="text-center">
         <p className="text-sm font-medium text-slate-200">Running OCR pipeline...</p>
-        <p className="text-xs text-slate-500 mt-1">DeepSeek OCR → DeepSeek Chat → JSON</p>
+        <p className="text-xs text-slate-500 mt-1">Tesseract OCR → Rule-based Parser → JSON</p>
       </div>
       <div className="flex gap-1">
         {[0, 1, 2].map((i) => (
